@@ -1,0 +1,274 @@
+diff --git a/packages/components/models.json b/packages/components/models.json
+index 6b8ce72..bbfff70 100644
+--- a/packages/components/models.json
++++ b/packages/components/models.json
+@@ -1761,6 +1761,13 @@
+         {
+             "name": "chatOpenAI",
+             "models": [
++                {
++                    "label": "gpt-5.6-luna",
++                    "name": "gpt-5.6-luna",
++                    "description": "GPT-5.6 Luna - Cost-optimized model for high-volume workloads",
++                    "input_cost": 0.0000002,
++                    "output_cost": 0.0000012
++                },
+                 {
+                     "label": "gpt-5.5",
+                     "name": "gpt-5.5",
+diff --git a/packages/components/nodes/chatmodels/ChatOpenAI/ChatOpenAI.ts b/packages/components/nodes/chatmodels/ChatOpenAI/ChatOpenAI.ts
+index 03c13fe..aac9682 100644
+--- a/packages/components/nodes/chatmodels/ChatOpenAI/ChatOpenAI.ts
++++ b/packages/components/nodes/chatmodels/ChatOpenAI/ChatOpenAI.ts
+@@ -87,6 +87,11 @@ class ChatOpenAI_ChatModels implements INode {
+                 name: 'reasoningEffort',
+                 type: 'options',
+                 options: [
++                    {
++                        label: 'None',
++                        name: 'none',
++                        description: 'Disable reasoning so function tools can be used through Chat Completions'
++                    },
+                     {
+                         label: 'Low',
+                         name: 'low'
+@@ -231,6 +236,9 @@ class ChatOpenAI_ChatModels implements INode {
+         const strictToolCalling = nodeData.inputs?.strictToolCalling as boolean
+         const basePath = nodeData.inputs?.basepath as string
+         const baseOptions = nodeData.inputs?.baseOptions
+-        const reasoningEffort = nodeData.inputs?.reasoningEffort as OpenAIClient.ReasoningEffort | null
++        // Luna supports function tools through Chat Completions only when reasoning
++        // is explicitly disabled. Use that safe default unless the flow overrides it.
++        const reasoningEffort = (nodeData.inputs?.reasoningEffort ??
++            (modelName === 'gpt-5.6-luna' ? 'none' : null)) as OpenAIClient.ReasoningEffort | null
+         const reasoningSummary = nodeData.inputs?.reasoningSummary as 'auto' | 'concise' | 'detailed' | null
+         const allowImageUploads = nodeData.inputs?.allowImageUploads as boolean
+diff --git a/packages/server/src/index.ts b/packages/server/src/index.ts
+index 566e7dd..b74cfa9 100644
+--- a/packages/server/src/index.ts
++++ b/packages/server/src/index.ts
+@@ -23,6 +23,7 @@ import { Prometheus } from './metrics/Prometheus'
+ import errorHandlerMiddleware from './middlewares/errors'
+ import { NodesPool } from './NodesPool'
+ import { QueueManager } from './queue/QueueManager'
++import { ExecutionRetention } from './schedule/ExecutionRetention'
+ import { ScheduleBeat } from './schedule/ScheduleBeat'
+ import { RedisEventSubscriber } from './queue/RedisEventSubscriber'
+ import { initWebhookListenerRegistry } from './services/webhook-listener'
+@@ -163,6 +164,9 @@ export class App {
+             await ScheduleBeat.getInstance().init()
+             logger.info('⏰ [server]: ScheduleBeat initialized successfully')
+ 
++            await ExecutionRetention.getInstance().init()
++            logger.info('🧹 [server]: Execution retention scheduler initialized successfully')
++
+             logger.info('🎉 [server]: All initialization steps completed successfully!')
+         } catch (error) {
+             logger.error('❌ [server]: Error during Data Source initialization:', error)
+@@ -372,6 +376,7 @@ export class App {
+     async stopApp() {
+         try {
+             this.sseStreamer.stopHeartbeat()
++            await ExecutionRetention.getInstance().shutdown()
+             const removePromises: any[] = []
+             removePromises.push(this.telemetry.flush())
+             if (this.queueManager) {
+diff --git a/packages/server/src/schedule/ExecutionRetention.ts b/packages/server/src/schedule/ExecutionRetention.ts
+new file mode 100644
+index 0000000..25d9531
+--- /dev/null
++++ b/packages/server/src/schedule/ExecutionRetention.ts
+@@ -0,0 +1,193 @@
++import cron, { ScheduledTask } from 'node-cron'
++import { In } from 'typeorm'
++import { ChatMessage } from '../database/entities/ChatMessage'
++import { Execution } from '../database/entities/Execution'
++import { getRunningExpressApp } from '../utils/getRunningExpressApp'
++import logger from '../utils/logger'
++
++const LOCK_NAME = 'flowise_execution_retention'
++const DEFAULT_CRON_EXPRESSION = '15 3 * * *'
++const DEFAULT_TIMEZONE = 'Europe/Madrid'
++const DEFAULT_RETENTION_DAYS = 90
++const DEFAULT_BATCH_SIZE = 250
++const DEFAULT_MAX_DELETIONS_PER_RUN = 10000
++
++interface RetentionConfig {
++    cronExpression: string
++    timezone: string
++    retentionDays: number
++    batchSize: number
++    maxDeletionsPerRun: number
++}
++
++const boundedPositiveInteger = (value: string | undefined, fallback: number, maximum: number): number => {
++    const parsed = Number.parseInt(value || '', 10)
++    if (!Number.isFinite(parsed) || parsed < 1) return fallback
++    return Math.min(parsed, maximum)
++}
++
++/**
++ * Deletes old, completed Agentflow execution traces.
++ *
++ * This is deliberately opt-in, because execution traces can be useful for
++ * troubleshooting. It never deletes Chatflows, credentials, API keys, chat
++ * messages, or executions still marked INPROGRESS. Chat messages that point to
++ * a deleted trace retain their content; only their optional executionId link is
++ * cleared first.
++ */
++export class ExecutionRetention {
++    private static instance: ExecutionRetention
++    private cronJob?: ScheduledTask
++    private isRunning = false
++
++    public static getInstance(): ExecutionRetention {
++        if (!ExecutionRetention.instance) {
++            ExecutionRetention.instance = new ExecutionRetention()
++        }
++        return ExecutionRetention.instance
++    }
++
++    public async init(): Promise<void> {
++        if (process.env.EXECUTION_RETENTION_ENABLED !== 'true') {
++            logger.info('[ExecutionRetention]: Disabled')
++            return
++        }
++
++        await this.ensureChatMessageExecutionIndex()
++        const config = this.getConfig()
++        if (!cron.validate(config.cronExpression)) {
++            logger.error(`[ExecutionRetention]: Invalid cron expression "${config.cronExpression}"; retention is disabled`)
++            return
++        }
++
++        this.cronJob = cron.schedule(
++            config.cronExpression,
++            () => {
++                void this.run()
++            },
++            { timezone: config.timezone }
++        )
++        logger.info(
++            `[ExecutionRetention]: Enabled: deleting completed execution traces older than ${config.retentionDays} days ` +
++                `at "${config.cronExpression}" (${config.timezone}), up to ${config.maxDeletionsPerRun} per run`
++        )
++    }
++
++    public async shutdown(): Promise<void> {
++        this.cronJob?.stop()
++        this.cronJob = undefined
++    }
++
++    private async ensureChatMessageExecutionIndex(): Promise<void> {
++        const appServer = getRunningExpressApp()
++        if (appServer.AppDataSource.options.type !== 'postgres') return
++
++        try {
++            await appServer.AppDataSource.query(
++                'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_message_execution_id ON chat_message ("executionId") WHERE "executionId" IS NOT NULL'
++            )
++            logger.info('[ExecutionRetention]: Verified chat_message executionId index')
++        } catch (error) {
++            // Retention remains safe without the index. The log makes an
++            // exceptional database-permission issue visible to operators.
++            logger.warn(`[ExecutionRetention]: Could not verify executionId index: ${error}`)
++        }
++    }
++
++    private getConfig(): RetentionConfig {
++        return {
++            cronExpression: process.env.EXECUTION_RETENTION_CRON || DEFAULT_CRON_EXPRESSION,
++            timezone: process.env.EXECUTION_RETENTION_TIMEZONE || DEFAULT_TIMEZONE,
++            retentionDays: boundedPositiveInteger(process.env.EXECUTION_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, 3650),
++            batchSize: boundedPositiveInteger(process.env.EXECUTION_RETENTION_BATCH_SIZE, DEFAULT_BATCH_SIZE, 1000),
++            maxDeletionsPerRun: boundedPositiveInteger(
++                process.env.EXECUTION_RETENTION_MAX_DELETIONS_PER_RUN,
++                DEFAULT_MAX_DELETIONS_PER_RUN,
++                25000
++            )
++        }
++    }
++
++    private async run(): Promise<void> {
++        if (this.isRunning) {
++            logger.warn('[ExecutionRetention]: Previous cleanup is still running; skipping this execution')
++            return
++        }
++
++        this.isRunning = true
++        const config = this.getConfig()
++        const cutoff = new Date()
++        cutoff.setDate(cutoff.getDate() - config.retentionDays)
++        const appServer = getRunningExpressApp()
++        const queryRunner = appServer.AppDataSource.createQueryRunner()
++        let lockHeld = false
++        let deletedCount = 0
++
++        try {
++            await queryRunner.connect()
++
++            // Railway uses PostgreSQL. The advisory lock makes the cleanup safe
++            // if the service is ever scaled to more than one replica.
++            if (appServer.AppDataSource.options.type === 'postgres') {
++                const result = await queryRunner.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [LOCK_NAME])
++                lockHeld = result[0]?.locked === true || result[0]?.locked === 't'
++                if (!lockHeld) {
++                    logger.info('[ExecutionRetention]: Another replica is already running the cleanup; skipping')
++                    return
++                }
++            }
++
++            while (deletedCount < config.maxDeletionsPerRun) {
++                const batchSize = Math.min(config.batchSize, config.maxDeletionsPerRun - deletedCount)
++                await queryRunner.startTransaction()
++
++                try {
++                    const executions = await queryRunner.manager
++                        .getRepository(Execution)
++                        .createQueryBuilder('execution')
++                        .select(['execution.id'])
++                        .where('execution.state <> :inProgress', { inProgress: 'INPROGRESS' })
++                        .andWhere('execution.createdDate < :cutoff', { cutoff })
++                        .orderBy('execution.createdDate', 'ASC')
++                        .take(batchSize)
++                        .getMany()
++                    const executionIds = executions.map((execution) => execution.id)
++
++                    if (!executionIds.length) {
++                        await queryRunner.commitTransaction()
++                        break
++                    }
++
++                    // Preserve chat content. executionId is only its optional
++                    // pointer to a diagnostic trace, not the chat itself.
++                    await queryRunner.manager.getRepository(ChatMessage).update({ executionId: In(executionIds) }, { executionId: null as any })
++                    const result = await queryRunner.manager.getRepository(Execution).delete({ id: In(executionIds) })
++                    await queryRunner.commitTransaction()
++
++                    const removed = result.affected || 0
++                    deletedCount += removed
++                    if (removed < batchSize) break
++                } catch (error) {
++                    await queryRunner.rollbackTransaction()
++                    throw error
++                }
++            }
++
++            logger.info(
++                `[ExecutionRetention]: Removed ${deletedCount} completed execution trace(s) created before ${cutoff.toISOString()}`
++            )
++        } catch (error) {
++            logger.error(`[ExecutionRetention]: Cleanup failed: ${error}`)
++        } finally {
++            if (lockHeld) {
++                try {
++                    await queryRunner.query('SELECT pg_advisory_unlock(hashtext($1))', [LOCK_NAME])
++                } catch (error) {
++                    logger.error(`[ExecutionRetention]: Could not release advisory lock: ${error}`)
++                }
++            }
++            if (!queryRunner.isReleased) await queryRunner.release()
++            this.isRunning = false
++        }
++    }
++}
